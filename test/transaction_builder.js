@@ -149,7 +149,6 @@ describe('TransactionBuilder', function () {
       txb.__inputs.forEach(function (i) {
         assert.strictEqual(i.prevOutType, 'scripthash')
         assert.strictEqual(i.redeemScriptType, 'multisig')
-        assert.strictEqual(i.signType, 'multisig')
       })
     })
 

@@ -5,11 +5,10 @@ const bscript = require('./script')
 const btemplates = require('./templates')
 const networks = require('./networks')
 const ops = require('bitcoin-ops')
+const payments = require('./payments')
+const scriptTypes = btemplates.types
 const typeforce = require('typeforce')
 const types = require('./types')
-const scriptTypes = btemplates.types
-const SIGNABLE = [btemplates.types.P2PKH, btemplates.types.P2PK, btemplates.types.MULTISIG]
-const P2SH = SIGNABLE.concat([btemplates.types.P2WPKH, btemplates.types.P2WSH])
 
 const ECPair = require('./ecpair')
 const Transaction = require('./transaction')
@@ -29,154 +28,113 @@ function supportedP2SHType (type) {
   ].indexOf(type) !== -1
 }
 
-function extractChunks (type, chunks, script) {
-  let pubKeys = []
-  let signatures = []
-  switch (type) {
-    case scriptTypes.P2PKH:
-      // if (redeemScript) throw new Error('Nonstandard... P2SH(P2PKH)')
-      pubKeys = chunks.slice(1)
-      signatures = chunks.slice(0, 1)
-      break
-
-    case scriptTypes.P2PK:
-      pubKeys[0] = script ? btemplates.pubKey.output.decode(script) : undefined
-      signatures = chunks.slice(0, 1)
-      break
-
-    case scriptTypes.MULTISIG:
-      if (script) {
-        const multisig = btemplates.multisig.output.decode(script)
-        pubKeys = multisig.pubKeys
-      }
-
-      signatures = chunks.slice(1).map(function (chunk) {
-        return chunk.length === 0 ? undefined : chunk
-      })
-      break
-  }
-
-  return {
-    pubKeys: pubKeys,
-    signatures: signatures
-  }
-}
-function expandInput (scriptSig, witnessStack) {
+function expandInput (scriptSig, witnessStack, type, scriptPubKey) {
   if (scriptSig.length === 0 && witnessStack.length === 0) return {}
-
-  let prevOutScript
-  let prevOutType
-  let scriptType
-  let script
-  let redeemScript
-  let witnessScript
-  let witnessScriptType
-  let redeemScriptType
-  let witness = false
-  let p2wsh = false
-  let p2sh = false
-  let witnessProgram
-  let chunks
-
-  const scriptSigChunks = bscript.decompile(scriptSig) || []
-  const sigType = btemplates.classifyInput(scriptSigChunks, true)
-  if (sigType === scriptTypes.P2SH) {
-    p2sh = true
-    redeemScript = scriptSigChunks[scriptSigChunks.length - 1]
-    redeemScriptType = btemplates.classifyOutput(redeemScript)
-    prevOutScript = btemplates.scriptHash.output.encode(bcrypto.hash160(redeemScript))
-    prevOutType = scriptTypes.P2SH
-    script = redeemScript
+  if (!type) {
+    let ssType = btemplates.classifyInput(scriptSig, true)
+    let wsType = btemplates.classifyWitness(witnessStack, true)
+    if (ssType === scriptTypes.NONSTANDARD) ssType = undefined
+    if (wsType === scriptTypes.NONSTANDARD) wsType = undefined
+    type = ssType || wsType
   }
 
-  const classifyWitness = btemplates.classifyWitness(witnessStack, true)
-  if (classifyWitness === scriptTypes.P2WSH) {
-    witnessScript = witnessStack[witnessStack.length - 1]
-    witnessScriptType = btemplates.classifyOutput(witnessScript)
-    p2wsh = true
-    witness = true
-    if (scriptSig.length === 0) {
-      prevOutScript = btemplates.witnessScriptHash.output.encode(bcrypto.sha256(witnessScript))
-      prevOutType = scriptTypes.P2WSH
-      if (redeemScript !== undefined) {
-        throw new Error('Redeem script given when unnecessary')
+  switch (type) {
+    case scriptTypes.P2WPKH: {
+      const { output, pubkey, signature } = payments.p2wpkh({ witness: witnessStack })
+
+      return {
+        prevOutScript: output,
+        prevOutType: scriptTypes.P2WPKH,
+        pubKeys: [pubkey],
+        signatures: [signature]
       }
-      // bare witness
+    }
+
+    case scriptTypes.P2PKH: {
+      const { output, pubkey, signature } = payments.p2pkh({ input: scriptSig })
+
+      return {
+        prevOutScript: output,
+        prevOutType: scriptTypes.P2PKH,
+        pubKeys: [pubkey],
+        signatures: [signature]
+      }
+    }
+
+    case scriptTypes.P2PK: {
+      console.log(scriptSig)
+      const { signature } = payments.p2pk({ input: scriptSig })
+
+      return {
+        prevOutType: scriptTypes.P2PK,
+        pubKeys: [undefined],
+        signatures: [signature]
+      }
+    }
+
+    case scriptTypes.MULTISIG: {
+      const { pubkeys, signatures } = payments.p2ms({
+        input: scriptSig,
+        output: scriptPubKey
+      }, { allowIncomplete: true })
+
+      return {
+        prevOutType: scriptTypes.MULTISIG,
+        pubKeys: pubkeys,
+        signatures: signatures
+      }
+    }
+  }
+
+  if (type === scriptTypes.P2SH) {
+    const { output, redeem } = payments.p2sh({
+      input: scriptSig,
+      witness: witnessStack
+    })
+
+    const outputType = btemplates.classifyOutput(redeem.output)
+    const expanded = expandInput(redeem.input, redeem.witness, outputType, redeem.output)
+    if (!expanded.prevOutType) return {}
+
+    return {
+      prevOutScript: output,
+      prevOutType: scriptTypes.P2SH,
+      redeemScript: redeem.output,
+      redeemScriptType: expanded.prevOutType,
+      witnessScript: expanded.witnessScript,
+      witnessScriptType: expanded.witnessScriptType,
+
+      pubKeys: expanded.pubKeys,
+      signatures: expanded.signatures
+    }
+  }
+
+  if (type === scriptTypes.P2WSH) {
+    const { output, redeem } = payments.p2wsh({
+      input: scriptSig,
+      witness: witnessStack
+    })
+    const outputType = btemplates.classifyOutput(redeem.output)
+    let expanded
+    if (outputType === scriptTypes.P2WPKH) {
+      expanded = expandInput(redeem.input, redeem.witness, outputType)
     } else {
-      if (!redeemScript) {
-        throw new Error('No redeemScript provided for P2WSH, but scriptSig non-empty')
-      }
-      witnessProgram = btemplates.witnessScriptHash.output.encode(bcrypto.sha256(witnessScript))
-      if (!redeemScript.equals(witnessProgram)) {
-        throw new Error('Redeem script didn\'t match witnessScript')
-      }
+      expanded = expandInput(bscript.compile(redeem.witness), [], outputType, redeem.output)
     }
+    if (!expanded.prevOutType) return {}
 
-    if (!supportedType(btemplates.classifyOutput(witnessScript))) {
-      throw new Error('unsupported witness script')
+    return {
+      prevOutScript: output,
+      prevOutType: scriptTypes.P2WSH,
+      witnessScript: redeem.output,
+      witnessScriptType: expanded.prevOutType,
+
+      pubKeys: expanded.pubKeys,
+      signatures: expanded.signatures
     }
-
-    script = witnessScript
-    scriptType = witnessScriptType
-    chunks = witnessStack.slice(0, -1)
-  } else if (classifyWitness === scriptTypes.P2WPKH) {
-    witness = true
-    const key = witnessStack[witnessStack.length - 1]
-    const keyHash = bcrypto.hash160(key)
-    if (scriptSig.length === 0) {
-      prevOutScript = btemplates.witnessPubKeyHash.output.encode(keyHash)
-      prevOutType = scriptTypes.P2WPKH
-      if (typeof redeemScript !== 'undefined') {
-        throw new Error('Redeem script given when unnecessary')
-      }
-    } else {
-      if (!redeemScript) {
-        throw new Error('No redeemScript provided for P2WPKH, but scriptSig wasn\'t empty')
-      }
-      witnessProgram = btemplates.witnessPubKeyHash.output.encode(keyHash)
-      if (!redeemScript.equals(witnessProgram)) {
-        throw new Error('Redeem script did not have the right witness program')
-      }
-    }
-
-    scriptType = scriptTypes.P2PKH
-    chunks = witnessStack
-  } else if (redeemScript) {
-    if (!supportedP2SHType(redeemScriptType)) {
-      throw new Error('Bad redeemscript!')
-    }
-
-    script = redeemScript
-    scriptType = redeemScriptType
-    chunks = scriptSigChunks.slice(0, -1)
-  } else {
-    prevOutType = scriptType = btemplates.classifyInput(scriptSig)
-    chunks = scriptSigChunks
   }
 
-  const expanded = extractChunks(scriptType, chunks, script)
-
-  const result = {
-    pubKeys: expanded.pubKeys,
-    signatures: expanded.signatures,
-    prevOutScript: prevOutScript,
-    prevOutType: prevOutType,
-    signType: scriptType,
-    signScript: script,
-    witness: Boolean(witness)
-  }
-
-  if (p2sh) {
-    result.redeemScript = redeemScript
-    result.redeemScriptType = redeemScriptType
-  }
-
-  if (p2wsh) {
-    result.witnessScript = witnessScript
-    result.witnessScriptType = witnessScriptType
-  }
-
-  return result
+  return {}
 }
 
 // could be done in expandInput, but requires the original Transaction for hashForSignature
